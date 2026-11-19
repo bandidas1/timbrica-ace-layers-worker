@@ -17,6 +17,7 @@
 #    "mix_db": -3, "min_dce": 0.0, "min_dpq": -0.15,      a take is delivered only if backing+layer (layer at mix_db
 #                                                         RMS under the backing) scores ≥ the backing on CE/PQ
 #                                                         AND PANNs hears the asked instrument, not a voice
+#    "min_harmony": 0.08, "min_beat": 0.15,              AND it fits: chords (pitched) / beats (drums), score.py
 #    "return_audio": "best" | "all" | "none",             bench: takes inline as base64 Opus
 #    "deadline_at": unix seconds}
 # Output {"ok": true, "audio_s", "gpu_s", "gpu", "model", "improved", "aes_backing",
@@ -189,6 +190,12 @@ def handler(job):
     mix_db = float(inp.get('mix_db', -3.0))
     min_dce = float(inp.get('min_dce', 0.0))
     min_dpq = float(inp.get('min_dpq', -0.15))
+    # The judge rewards ANY layer on a thin backing (bench 20.11: another song's strings over the MIDI backing scored
+    # ΔCE +0.69, even a noise bed +0.26), so a delivered take must also FIT: chords for pitched parts, beats for drums.
+    # Own good takes vs other songs' takes over the same backing: harmony ≥ 0.08 kept 20/24 and let 4/120 through;
+    # beat ≥ 0.15 kept 5/5 and let 0/60 through.
+    min_harmony = float(inp.get('min_harmony', 0.08))
+    min_beat = float(inp.get('min_beat', 0.15))
     results = inp.get('result_urls') or {}
     t0 = time.time()
     try:
@@ -230,7 +237,8 @@ def handler(job):
                         s['dPQ'] = round(a['PQ'] - aes0['PQ'], 3)
                         s.update(_instrument(ty.T, tsr, name))
                         right = name not in FAMILY or (s['fam'] >= FAM_MIN and s['sing'] < SING_MAX)
-                        s['ok'] = bool(s['dCE'] >= min_dce and s['dPQ'] >= min_dpq and right)
+                        fits = s['beat'] >= min_beat if name in ('drums', 'percussion') else s['harmony'] >= min_harmony
+                        s['ok'] = bool(s['dCE'] >= min_dce and s['dPQ'] >= min_dpq and right and fits)
                         # the mix decides; the fit numbers break ties and keep a lucky noise out
                         s['rank'] = round(s['dCE'] + s['dPQ'] + 0.25 * s['rank'], 3)
                     s['seed'] = seed_base + k
