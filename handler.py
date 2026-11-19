@@ -16,6 +16,7 @@
 #    "result_urls": {"strings": signed PUT, ...},         production: the best take per track, FLAC (StemTransfer)
 #    "mix_db": -3, "min_dce": 0.0, "min_dpq": -0.15,      a take is delivered only if backing+layer (layer at mix_db
 #                                                         RMS under the backing) scores ≥ the backing on CE/PQ
+#                                                         AND PANNs hears the asked instrument, not a voice
 #    "return_audio": "best" | "all" | "none",             bench: takes inline as base64 Opus
 #    "deadline_at": unix seconds}
 # Output {"ok": true, "audio_s", "gpu_s", "gpu", "model", "improved", "aes_backing",
@@ -29,6 +30,7 @@ import tempfile
 import time
 
 import numpy as np
+import librosa
 import soundfile as sf
 import torch
 
@@ -70,6 +72,39 @@ def _mix(back, layer, db):
     m = b + l * (rb / rl) * (10 ** (db / 20))
     peak = float(np.max(np.abs(m))) or 1.0
     return m / max(1.0, peak / 0.95)
+
+# PANNs Cnn14 (code MIT, weights CC BY 4.0, Kong et al. 2020; baked in the image): is the take the instrument the
+# person asked for, and does it not sing. Bench 20.11.2026: chosen by the mix alone, 25–75 % of the delivered
+# «strings» / «drums» were heard by Cnn14 as something else (a synth pad, a piano, a choir); with this gate the
+# share of tracks delivered moved by a few points and every delivered take was the asked family.
+from panns_inference import AudioTagging, labels as PANN_LABELS  # noqa: E402
+PANNS = AudioTagging(checkpoint_path=os.path.join(os.path.expanduser('~'), 'panns_data', 'Cnn14_mAP=0.431.pth'), device='cuda')
+FAMILY = {
+    'strings': ['Violin, fiddle', 'Bowed string instrument', 'String section', 'Cello', 'Orchestra', 'Double bass'],
+    'keyboard': ['Piano', 'Electric piano', 'Keyboard (musical)', 'Synthesizer', 'Organ', 'Electronic organ', 'Hammond organ'],
+    'drums': ['Drum kit', 'Drum machine', 'Drum', 'Snare drum', 'Bass drum', 'Hi-hat', 'Cymbal', 'Percussion', 'Drum roll'],
+    'bass': ['Bass guitar', 'Double bass'],
+    'guitar': ['Guitar', 'Electric guitar', 'Acoustic guitar', 'Plucked string instrument'],
+    'synth': ['Synthesizer', 'Electronic music'],
+    'brass': ['Brass instrument', 'Trumpet', 'Trombone', 'French horn'],
+}
+SINGING = ['Singing', 'Male singing', 'Female singing', 'Vocal music', 'Speech', 'Choir', 'Synthetic singing']
+FAM_MIN, SING_MAX = 0.15, 0.2
+
+
+def _instrument(layer, sr, track):
+    """{fam: share of the asked family in Cnn14's top-10 mass, sing: the strongest voice label, top: 3 labels}."""
+    m = layer.mean(0)
+    if sr != 32000:
+        m = librosa.resample(m, orig_sr=sr, target_sr=32000)
+    clip, _ = PANNS.inference(m[None, :].astype(np.float32))
+    pr = clip[0]
+    top = np.argsort(pr)[::-1][:10]
+    mass = float(pr[top].sum()) + 1e-9
+    fam = sum(float(pr[PANN_LABELS.index(l)]) for l in FAMILY.get(track, []) if PANN_LABELS.index(l) in top) / mass
+    sing = max(float(pr[PANN_LABELS.index(l)]) for l in SINGING)
+    return {'fam': round(fam, 3), 'sing': round(sing, 3), 'top': [PANN_LABELS[i] for i in top[:3]]}
+
 
 _H = {'h': None, 'model': None}
 
@@ -193,14 +228,20 @@ def handler(job):
                         a = _aes(_mix(y.T, ty.T, mix_db), sr)
                         s['dCE'] = round(a['CE'] - aes0['CE'], 3)
                         s['dPQ'] = round(a['PQ'] - aes0['PQ'], 3)
-                        s['ok'] = bool(s['dCE'] >= min_dce and s['dPQ'] >= min_dpq)
+                        s.update(_instrument(ty.T, tsr, name))
+                        right = name not in FAMILY or (s['fam'] >= FAM_MIN and s['sing'] < SING_MAX)
+                        s['ok'] = bool(s['dCE'] >= min_dce and s['dPQ'] >= min_dpq and right)
                         # the mix decides; the fit numbers break ties and keep a lucky noise out
                         s['rank'] = round(s['dCE'] + s['dPQ'] + 0.25 * s['rank'], 3)
                     s['seed'] = seed_base + k
                     s['_path'] = path
                     rows.append(s)
-                best = int(np.argmax([r['rank'] for r in rows]))
-                improved = bool(rows[best].get('ok', True))
+                # the best of the takes that passed — a better-ranked take of the wrong instrument does not
+                # hide a good one (v2 picked the argmax and dropped the track when it failed)
+                passed = [i for i, r in enumerate(rows) if r.get('ok', True)]
+                pool = passed or list(range(len(rows)))
+                best = max(pool, key=lambda i: rows[i]['rank'])
+                improved = bool(passed)
                 entry = {'best': best, 'improved': improved, 'takes': [{k: v for k, v in r.items() if k != '_path'} for r in rows]}
                 if want in ('best', 'all'):
                     pick = rows if want == 'all' else [rows[best]]
