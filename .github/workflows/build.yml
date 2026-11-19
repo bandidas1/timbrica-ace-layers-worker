@@ -1,0 +1,64 @@
+name: build-and-push
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "handler.py"
+      - "layers_io.py"
+      - "score.py"
+      - "io_selftest.py"
+      - "score_selftest.py"
+      - "download_models.py"
+      - "Dockerfile"
+      - ".github/workflows/build.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Delivery of the layers and the take ranking: red here = a paid result lost on a dropped connection,
+      # or a worse take delivered than one the worker had. Stop the image before it ships.
+      - name: Self-tests (transfer + take ranking)
+        run: |
+          python3 -m pip install -q requests numpy librosa==0.11.0 soundfile
+          python3 io_selftest.py
+          python3 score_selftest.py
+
+      # CUDA runtime + torch cu128 + ~6.3 GB of baked weights — free the runner disk first.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/timbrica-ace-layers-worker:latest
+            ghcr.io/${{ github.repository_owner }}/timbrica-ace-layers-worker:${{ github.sha }}
+          provenance: false

@@ -1,0 +1,37 @@
+# RunPod serverless worker: «Улучшить минус» — ACE-Step 1.5 `lego` layers over a person's backing track.
+#
+# ACE-Step 1.5 (github.com/ace-step/ACE-Step-1.5, MIT — code and weights) pinned to the commit the app repo's bench
+# ran on (ca1e85f, 29.08.2026: after upstream PR #1287, which stopped the LM's codes from replacing src_audio in
+# lego). Its own lock file (uv.lock) installs the exact Linux stack: torch 2.10.0+cu128 (Blackwell included).
+#
+# Baked weights (a cold start pulls the image, never a checkpoint): acestep-v15-base DiT + VAE + Qwen3-Embedding-0.6B.
+# The 5 Hz LM is NOT needed (lego runs with thinking off). acestep-v15-xl-base (20 GB) is fetched at runtime only
+# when a bench job asks for it — production uses the baked base.
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONUNBUFFERED=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 TOKENIZERS_PARALLELISM=false ACE_ROOT=/app/ace \
+    UV_PROJECT_ENVIRONMENT=/app/ace/.venv
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common git curl ca-certificates ffmpeg libsndfile1 \
+    && add-apt-repository ppa:deadsnakes/ppa && apt-get update \
+    && apt-get install -y --no-install-recommends python3.11 python3.11-dev python3.11-venv \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.7.8 /uv /uvx /bin/
+
+ARG ACE_COMMIT=ca1e85fe9430179831e6bc6be790c332190a3866
+RUN git clone https://github.com/ace-step/ACE-Step-1.5.git /app/ace \
+    && cd /app/ace && git checkout ${ACE_COMMIT} && rm -rf .git \
+    && uv sync --frozen --no-dev --python python3.11 \
+    && uv pip install --python /app/ace/.venv/bin/python runpod==1.7.9 requests librosa==0.11.0 \
+    && /app/ace/.venv/bin/python -c "import torch, acestep, runpod, librosa; print('torch', torch.__version__)"
+
+WORKDIR /app/worker
+COPY download_models.py .
+RUN /app/ace/.venv/bin/python download_models.py
+
+COPY layers_io.py score.py handler.py io_selftest.py score_selftest.py ./
+RUN /app/ace/.venv/bin/python score_selftest.py
+
+CMD ["/app/ace/.venv/bin/python", "-u", "/app/worker/handler.py"]
