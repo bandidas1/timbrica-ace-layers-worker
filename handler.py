@@ -89,7 +89,12 @@ FAMILY = {
     'synth': ['Synthesizer', 'Electronic music'],
     'brass': ['Brass instrument', 'Trumpet', 'Trombone', 'French horn'],
 }
-SINGING = ['Singing', 'Male singing', 'Female singing', 'Vocal music', 'Speech', 'Choir', 'Synthetic singing']
+# a voice of any kind is a defect in a backing part: lego sometimes mumbles speech, raps or beatboxes over the backing
+# (v3/v4 bench: «Rapping», «Beatboxing» among the top labels of a «drums» take). The extended list dropped 0 of the 22
+# good bench takes.
+SINGING = ['Singing', 'Male singing', 'Female singing', 'Vocal music', 'Speech', 'Choir', 'Synthetic singing',
+           'Beatboxing', 'Rapping', 'Humming', 'Chant', 'Yodeling', 'Whispering', 'Babbling', 'Child singing',
+           'Speech synthesizer', 'Narration, monologue']
 FAM_MIN, SING_MAX = 0.15, 0.2
 
 
