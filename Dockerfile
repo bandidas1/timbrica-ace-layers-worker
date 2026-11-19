@@ -4,7 +4,8 @@
 # ran on (ca1e85f, 29.08.2026: after upstream PR #1287, which stopped the LM's codes from replacing src_audio in
 # lego). Its own lock file (uv.lock) installs the exact Linux stack: torch 2.10.0+cu128 (Blackwell included).
 #
-# Baked weights (a cold start pulls the image, never a checkpoint): acestep-v15-base DiT + VAE + Qwen3-Embedding-0.6B.
+# Baked weights (a cold start pulls the image, never a checkpoint): acestep-v15-base DiT + VAE + Qwen3-Embedding-0.6B,
+# and Meta's audiobox-aesthetics (CC BY 4.0) that judges each take by the mix it makes.
 # The 5 Hz LM is NOT needed (lego runs with thinking off). acestep-v15-xl-base (20 GB) is fetched at runtime only
 # when a bench job asks for it — production uses the baked base.
 FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
@@ -24,8 +25,8 @@ ARG ACE_COMMIT=ca1e85fe9430179831e6bc6be790c332190a3866
 RUN git clone https://github.com/ace-step/ACE-Step-1.5.git /app/ace \
     && cd /app/ace && git checkout ${ACE_COMMIT} && rm -rf .git \
     && uv sync --frozen --no-dev --python python3.11 \
-    && uv pip install --python /app/ace/.venv/bin/python runpod==1.7.9 requests librosa==0.11.0 \
-    && /app/ace/.venv/bin/python -c "import torch, acestep, runpod, librosa; print('torch', torch.__version__)"
+    && uv pip install --python /app/ace/.venv/bin/python runpod==1.7.9 requests librosa==0.11.0 audiobox_aesthetics==0.0.4 \
+    && /app/ace/.venv/bin/python -c "import torch, acestep, runpod, librosa, audiobox_aesthetics; print('torch', torch.__version__)"
 
 WORKDIR /app/worker
 COPY download_models.py .

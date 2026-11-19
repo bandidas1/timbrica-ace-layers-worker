@@ -13,11 +13,14 @@
 #    "tracks": [{"name": "strings", "caption": "..."}],   names from TRACKS below
 #    "takes": 3, "steps": 40, "guidance": 7.0, "shift": 1.0, "use_adg": false, "seed_base": 1000,
 #    "model": "base" | "xl", "bpm": null, "keyscale": "",
-#    "result_urls": {"strings": signed PUT, ...},         production: the best take per track, AAC in .m4a
+#    "result_urls": {"strings": signed PUT, ...},         production: the best take per track, FLAC (StemTransfer)
+#    "mix_db": -3, "min_dce": 0.0, "min_dpq": -0.15,      a take is delivered only if backing+layer (layer at mix_db
+#                                                         RMS under the backing) scores ≥ the backing on CE/PQ
 #    "return_audio": "best" | "all" | "none",             bench: takes inline as base64 Opus
 #    "deadline_at": unix seconds}
-# Output {"ok": true, "audio_s", "gpu_s", "gpu", "model", "tracks": {name: {"best": i, "takes": [score...]}}} or
-#        {"error": code}
+# Output {"ok": true, "audio_s", "gpu_s", "gpu", "model", "improved", "aes_backing",
+#         "tracks": {name: {"best": i, "improved", "bytes", "takes": [score...]}}}  or  {"error": code}
+#        A track whose best take did not improve the mix is NOT uploaded (improved: false).
 import base64
 import os
 import subprocess
@@ -43,6 +46,30 @@ MODELS = {'base': 'acestep-v15-base', 'xl': 'acestep-v15-xl-base'}
 MAX_SECONDS = float(os.environ.get('LAYERS_MAX_SECONDS', '480'))
 MAX_TAKES = int(os.environ.get('LAYERS_MAX_TAKES', '6'))
 GPU = torch.cuda.get_device_name(0)
+
+# Meta's audiobox-aesthetics (CC BY 4.0, facebook/audiobox-aesthetics, baked in the image): the take is judged by
+# what the MIX does — backing + layer against the backing alone (CE content enjoyment, PQ production quality).
+# Bench 19.11.2026: on cheap / hollow backings good takes add CE +0.7…+2.2; on an already full production every
+# take made it worse (CE −0.2…−1.4) — a layer that makes the person's music worse is not delivered.
+from audiobox_aesthetics.infer import initialize_predictor  # noqa: E402
+AES = initialize_predictor()
+
+
+def _aes(arr, sr):
+    r = AES.forward([{'path': torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32)), 'sample_rate': sr}])[0]
+    return {k: float(v) for k, v in r.items()}
+
+
+def _mix(back, layer, db):
+    n = min(back.shape[1], layer.shape[1])
+    b, l = back[:, :n], layer[:, :n]
+    if l.shape[0] == 1:
+        l = np.vstack([l, l])
+    rb = float(np.sqrt(np.mean(b ** 2)) + 1e-12)
+    rl = float(np.sqrt(np.mean(l ** 2)) + 1e-12)
+    m = b + l * (rb / rl) * (10 ** (db / 20))
+    peak = float(np.max(np.abs(m))) or 1.0
+    return m / max(1.0, peak / 0.95)
 
 _H = {'h': None, 'model': None}
 
@@ -77,7 +104,10 @@ def _decode(path, td):
 
 
 def _encode(wav_path, fmt, td, name):
-    if fmt == 'opus':
+    if fmt == 'flac':
+        out = os.path.join(td, name + '.flac')
+        args = ['-c:a', 'flac', '-sample_fmt', 's16']
+    elif fmt == 'opus':
         out = os.path.join(td, name + '.ogg')
         args = ['-c:a', 'libopus', '-b:a', '96k']
     else:
@@ -121,6 +151,9 @@ def handler(job):
     seed_base = int(inp.get('seed_base', 1000))
     model = inp.get('model', 'base') if inp.get('model', 'base') in MODELS else 'base'
     want = inp.get('return_audio', 'none')
+    mix_db = float(inp.get('mix_db', -3.0))
+    min_dce = float(inp.get('min_dce', 0.0))
+    min_dpq = float(inp.get('min_dpq', -0.15))
     results = inp.get('result_urls') or {}
     t0 = time.time()
     try:
@@ -138,6 +171,7 @@ def handler(job):
                 return {'error': 'too_long', 'seconds': round(seconds)}
             y, sr = sf.read(src, always_2d=True, dtype='float32')
             back = score.analyse_backing(y.T, sr)
+            aes0 = _aes(y.T, sr)
             h = _ensure_model(model)
             out = {}
             gpu_s = 0.0
@@ -155,22 +189,31 @@ def handler(job):
                     ty, tsr = sf.read(path, always_2d=True, dtype='float32')
                     s = score.score_take(back, ty.T, tsr)
                     s['rank'] = score.rank_value(name, s)
+                    if tsr == sr:
+                        a = _aes(_mix(y.T, ty.T, mix_db), sr)
+                        s['dCE'] = round(a['CE'] - aes0['CE'], 3)
+                        s['dPQ'] = round(a['PQ'] - aes0['PQ'], 3)
+                        s['ok'] = bool(s['dCE'] >= min_dce and s['dPQ'] >= min_dpq)
+                        # the mix decides; the fit numbers break ties and keep a lucky noise out
+                        s['rank'] = round(s['dCE'] + s['dPQ'] + 0.25 * s['rank'], 3)
                     s['seed'] = seed_base + k
                     s['_path'] = path
                     rows.append(s)
                 best = int(np.argmax([r['rank'] for r in rows]))
-                entry = {'best': best, 'takes': [{k: v for k, v in r.items() if k != '_path'} for r in rows]}
+                improved = bool(rows[best].get('ok', True))
+                entry = {'best': best, 'improved': improved, 'takes': [{k: v for k, v in r.items() if k != '_path'} for r in rows]}
                 if want in ('best', 'all'):
                     pick = rows if want == 'all' else [rows[best]]
                     entry['audio'] = [base64.b64encode(open(_encode(r['_path'], 'opus', td, '%s_%d' % (name, r['seed'])), 'rb').read()).decode()
                                       for r in pick]
-                if name in results:
-                    f = _encode(rows[best]['_path'], 'aac', td, name)
-                    layers_io.upload(results[name], f, content_type='audio/mp4', deadline=deadline)
+                if name in results and improved:
+                    f = _encode(rows[best]['_path'], 'flac', td, name)
+                    layers_io.upload(results[name], f, content_type='audio/flac', deadline=deadline)
                     entry['bytes'] = os.path.getsize(f)
                 out[name] = entry
             return {'ok': True, 'audio_s': round(seconds, 2), 'gpu_s': round(gpu_s, 2), 'wall_s': round(time.time() - t0, 2),
-                    'gpu': GPU, 'model': model, 'takes': takes, 'tracks': out}
+                    'gpu': GPU, 'model': model, 'takes': takes, 'tracks': out, 'aes_backing': aes0,
+                    'improved': any(v.get('improved') for v in out.values())}
     except layers_io.TransferError as e:
         return {'error': e.code, 'detail': str(e)[:160]}
     except torch.cuda.OutOfMemoryError:

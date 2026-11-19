@@ -14,6 +14,10 @@ BASE_REV = 'e432212fec32b8965a14ffa57ae653438d6abd14'      # ACE-Step/acestep-v1
 snapshot_download('ACE-Step/Ace-Step1.5', revision=MAIN_REV, local_dir=ROOT,
                   allow_patterns=['vae/*', 'Qwen3-Embedding-0.6B/*', 'config.json', 'configuration.json', 'README.md'])
 snapshot_download('ACE-Step/acestep-v15-base', revision=BASE_REV, local_dir=os.path.join(ROOT, 'acestep-v15-base'))
+# Meta's audiobox-aesthetics (CC BY 4.0) — judges each take by the MIX it makes; loaded by from_pretrained from
+# the HF cache at runtime, so it goes into the default cache, pinned.
+AES_REV = '9b1dd8e5df9af7216e836a98974fe3b82c56ded6'   # facebook/audiobox-aesthetics, 20.11.2026
+snapshot_download('facebook/audiobox-aesthetics', revision=AES_REV)
 for d in ('vae', 'Qwen3-Embedding-0.6B', 'acestep-v15-base'):
     p = os.path.join(ROOT, d)
     assert os.path.isdir(p) and os.listdir(p), 'missing ' + p
