@@ -29,10 +29,11 @@ RUN git clone https://github.com/ace-step/ACE-Step-1.5.git /app/ace \
         panns_inference==0.1.1 torchlibrosa==0.1.0 matplotlib \
     && /app/ace/.venv/bin/python -c "import torch, acestep, runpod, librosa, audiobox_aesthetics; print('torch', torch.__version__)"
 
-# PANNs Cnn14 (Kong et al., weights CC BY 4.0, zenodo.org/records/3987831) + the AudioSet labels: the instrument
-# check. panns_inference reads both from ~/panns_data (and would fetch the labels with wget at import) — baked, pinned.
+# PANNs Cnn14 (Kong et al., weights CC BY 4.0, published at zenodo.org/records/3987831) + the AudioSet labels: the
+# instrument check. Zenodo answers 403 to GitHub's runners (20.11.2026), so the weights come from a Hugging Face mirror
+# pinned to a revision; the sha256 below is Zenodo's file — byte for byte the same model. panns_inference reads both from ~/panns_data (and would fetch the labels with wget at import) — baked, pinned.
 RUN mkdir -p /root/panns_data \
-    && curl -fsSL -o '/root/panns_data/Cnn14_mAP=0.431.pth' 'https://zenodo.org/records/3987831/files/Cnn14_mAP%3D0.431.pth?download=1' \
+    && curl -fsSL -o '/root/panns_data/Cnn14_mAP=0.431.pth' 'https://huggingface.co/thelou1s/panns-inference/resolve/f98a09ed0dca73b284786393cfc2b2bd6f46f878/Cnn14_mAP%3D0.431.pth' \
     && curl -fsSL -o /root/panns_data/class_labels_indices.csv 'http://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv' \
     && echo '0dc499e40e9761ef5ea061ffc77697697f277f6a960894903df3ada000e34b31  /root/panns_data/Cnn14_mAP=0.431.pth' | sha256sum -c - \
     && echo 'cdd1049833c4b86127c2773ac0d14a2754b6a6d0d1798002ed5c66e699708429  /root/panns_data/class_labels_indices.csv' | sha256sum -c - \
