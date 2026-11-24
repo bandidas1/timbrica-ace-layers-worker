@@ -26,6 +26,7 @@
 import base64
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import tempfile
 import time
@@ -113,6 +114,11 @@ def _instrument(layer, sr, track):
 
 
 _H = {'h': None, 'model': None}
+
+# A take is judged (score.py on the CPU, audiobox + PANNs briefly on the GPU) while the NEXT take is generated:
+# judging one take of a 3.5-min backing costs about what generating it does (13.7 s vs 14.3 s, prod 24.11.2026),
+# and run in turn it doubled the wait. One thread: the takes are judged in order, never two at once.
+JUDGE = ThreadPoolExecutor(max_workers=1)
 
 
 def _ensure_model(key):
@@ -230,53 +236,71 @@ def handler(job):
             gpu_s = 0.0
             score_s = 0.0
             deliver_s = 0.0
-            for t in tracks:
-                name = t['name']
-                caption = (t.get('caption') or name)[:400]
-                rows = []
-                for k in range(takes):
-                    if deadline and time.time() > deadline:
-                        return {'error': 'deadline_passed'}
-                    g0 = time.time()
-                    path = _take(h, src, name, caption, seed_base + k, p, td)
-                    torch.cuda.synchronize()
-                    gpu_s += time.time() - g0
-                    s0 = time.time()
-                    ty, tsr = sf.read(path, always_2d=True, dtype='float32')
-                    s = score.score_take(back, ty.T, tsr, harmony=name not in ('drums', 'percussion'))
-                    s['rank'] = score.rank_value(name, s)
-                    if tsr == sr:
-                        a = _aes(_mix(y.T, ty.T, mix_db), sr)
-                        s['dCE'] = round(a['CE'] - aes0['CE'], 3)
-                        s['dPQ'] = round(a['PQ'] - aes0['PQ'], 3)
-                        s.update(_instrument(ty.T, tsr, name))
-                        right = name not in FAMILY or (s['fam'] >= FAM_MIN and s['sing'] < SING_MAX)
-                        fits = s['beat'] >= min_beat if name in ('drums', 'percussion') else s['harmony'] >= min_harmony
-                        s['ok'] = bool(s['dCE'] >= min_dce and s['dPQ'] >= min_dpq and right and fits)
-                        # the mix decides; the fit numbers break ties and keep a lucky noise out
-                        s['rank'] = round(s['dCE'] + s['dPQ'] + 0.25 * s['rank'], 3)
-                    s['seed'] = seed_base + k
-                    s['_path'] = path
-                    rows.append(s)
-                    score_s += time.time() - s0
-                # the best of the takes that passed — a better-ranked take of the wrong instrument does not
-                # hide a good one (v2 picked the argmax and dropped the track when it failed)
-                passed = [i for i, r in enumerate(rows) if r.get('ok', True)]
-                pool = passed or list(range(len(rows)))
-                best = max(pool, key=lambda i: rows[i]['rank'])
-                improved = bool(passed)
-                entry = {'best': best, 'improved': improved, 'takes': [{k: v for k, v in r.items() if k != '_path'} for r in rows]}
-                if want in ('best', 'all'):
-                    pick = rows if want == 'all' else [rows[best]]
-                    entry['audio'] = [base64.b64encode(open(_encode(r['_path'], 'opus', td, '%s_%d' % (name, r['seed'])), 'rb').read()).decode()
-                                      for r in pick]
-                if name in results and improved:
-                    d0 = time.time()
-                    f = _encode(rows[best]['_path'], 'flac', td, name)
-                    layers_io.upload(results[name], f, content_type='audio/flac', deadline=deadline)
-                    entry['bytes'] = os.path.getsize(f)
-                    deliver_s += time.time() - d0
-                out[name] = entry
+            def judge(name, path, k):
+                s0 = time.time()
+                ty, tsr = sf.read(path, always_2d=True, dtype='float32')
+                s = score.score_take(back, ty.T, tsr, harmony=name not in ('drums', 'percussion'))
+                s['rank'] = score.rank_value(name, s)
+                if tsr == sr:
+                    a = _aes(_mix(y.T, ty.T, mix_db), sr)
+                    s['dCE'] = round(a['CE'] - aes0['CE'], 3)
+                    s['dPQ'] = round(a['PQ'] - aes0['PQ'], 3)
+                    s.update(_instrument(ty.T, tsr, name))
+                    right = name not in FAMILY or (s['fam'] >= FAM_MIN and s['sing'] < SING_MAX)
+                    fits = s['beat'] >= min_beat if name in ('drums', 'percussion') else s['harmony'] >= min_harmony
+                    s['ok'] = bool(s['dCE'] >= min_dce and s['dPQ'] >= min_dpq and right and fits)
+                    # the mix decides; the fit numbers break ties and keep a lucky noise out
+                    s['rank'] = round(s['dCE'] + s['dPQ'] + 0.25 * s['rank'], 3)
+                s['seed'] = seed_base + k
+                s['_path'] = path
+                return s, time.time() - s0
+
+            futs = {}
+            try:
+                for t in tracks:
+                    name = t['name']
+                    caption = (t.get('caption') or name)[:400]
+                    futs[name] = []
+                    for k in range(takes):
+                        if deadline and time.time() > deadline:
+                            return {'error': 'deadline_passed'}
+                        g0 = time.time()
+                        path = _take(h, src, name, caption, seed_base + k, p, td)
+                        torch.cuda.synchronize()
+                        gpu_s += time.time() - g0
+                        futs[name].append(JUDGE.submit(judge, name, path, k))
+                w0 = time.time()
+                for t in tracks:
+                    name = t['name']
+                    rows = []
+                    for f in futs[name]:
+                        r, dt = f.result()
+                        rows.append(r)
+                        score_s += dt
+                    # the best of the takes that passed — a better-ranked take of the wrong instrument does not
+                    # hide a good one (v2 picked the argmax and dropped the track when it failed)
+                    passed = [i for i, r in enumerate(rows) if r.get('ok', True)]
+                    pool = passed or list(range(len(rows)))
+                    best = max(pool, key=lambda i: rows[i]['rank'])
+                    improved = bool(passed)
+                    entry = {'best': best, 'improved': improved, 'takes': [{k: v for k, v in r.items() if k != '_path'} for r in rows]}
+                    if want in ('best', 'all'):
+                        pick = rows if want == 'all' else [rows[best]]
+                        entry['audio'] = [base64.b64encode(open(_encode(r['_path'], 'opus', td, '%s_%d' % (name, r['seed'])), 'rb').read()).decode()
+                                          for r in pick]
+                    if name in results and improved:
+                        d0 = time.time()
+                        f = _encode(rows[best]['_path'], 'flac', td, name)
+                        layers_io.upload(results[name], f, content_type='audio/flac', deadline=deadline)
+                        entry['bytes'] = os.path.getsize(f)
+                        deliver_s += time.time() - d0
+                    out[name] = entry
+                tm['judge_tail_s'] = time.time() - w0
+            finally:
+                # a job that ends early leaves no take queued for judging behind it
+                for fl in futs.values():
+                    for f in fl:
+                        f.cancel()
             tm.update(gen_s=gpu_s, score_s=score_s, deliver_s=deliver_s)
             return {'ok': True, 'audio_s': round(seconds, 2), 'gpu_s': round(gpu_s, 2), 'wall_s': round(time.time() - t0, 2),
                     'timing': {k: round(v, 1) for k, v in tm.items()},
