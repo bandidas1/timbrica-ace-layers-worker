@@ -13,6 +13,13 @@ import librosa
 
 SR = 22050
 HOP = 220          # 100 frames per second
+# Chroma is only ever averaged per BEAT (30–70 frames of HOP), so it is computed on a coarser grid. CQT's
+# multirate filter bank decimates only as far as the hop divides by 2^octaves: at hop 220 (= 4·55) it could not,
+# and chroma_cqt of a 218-s take took 21–27 s on the CPU — most of the worker's time between two 13-s takes
+# (prod log 24.11.2026; jobs of 3.5 min backings ran 10–19 min for 1.5–2.5 min of generation). Hop 512: 2.9 s.
+# Same numbers: 192 bench pairs (the ones min_harmony 0.08 was fitted on) — corr 0.9996, mean |Δ| 0.0009,
+# 2 of 192 gate decisions moved, both within 0.004 of the threshold (bench/chroma_hop_compare-scratch.py).
+CHROMA_HOP = 512
 
 
 def _mono(y, sr):
@@ -43,13 +50,21 @@ def _xcorr_peak(a, b, maxlag):
     return float(best / (na * nb)), bl
 
 
+def _chroma(m):
+    return librosa.feature.chroma_cqt(y=m, sr=SR, hop_length=CHROMA_HOP)
+
+
+def _beats_on_chroma_grid(beats):
+    """Beat frames of the onset grid (HOP) as frames of the chroma grid (CHROMA_HOP)."""
+    return np.unique(np.round(np.asarray(beats, dtype=np.float64) * HOP / CHROMA_HOP).astype(int))
+
+
 def analyse_backing(y, sr):
     """Everything about the backing the takes are compared with — computed once per job."""
     m = _mono(y, sr)
     on = _onset(m)
     tempo, beats = librosa.beat.beat_track(onset_envelope=on, sr=SR, hop_length=HOP)
-    ch = librosa.feature.chroma_cqt(y=m, sr=SR, hop_length=HOP)
-    return {'onset': on, 'beats': beats, 'chroma': ch, 'n': len(m)}
+    return {'onset': on, 'beats': beats, 'chroma': _chroma(m), 'beats_c': _beats_on_chroma_grid(beats), 'n': len(m)}
 
 
 def _sync_chroma(ch, beats):
@@ -58,25 +73,31 @@ def _sync_chroma(ch, beats):
     return librosa.util.sync(ch, beats, aggregate=np.mean)
 
 
-def score_take(back, y, sr):
+def score_take(back, y, sr, harmony=True):
+    """harmony=False — a part without pitch (drums, percussion): its gate and rank never read harmony, so
+    its chroma is not computed (harmony 0.0)."""
     m = _mono(y, sr)
     m = m[:back['n']] if len(m) > back['n'] else np.pad(m, (0, back['n'] - len(m)))
     beat, lag = _xcorr_peak(back['onset'], _onset(m), maxlag=6)
-    ch = librosa.feature.chroma_cqt(y=m, sr=SR, hop_length=HOP)
-    a = _sync_chroma(back['chroma'], back['beats'])
-    b = _sync_chroma(ch, back['beats'])
-    k = min(a.shape[1], b.shape[1])
-    a, b = a[:, :k], b[:, :k]
-    energy = b.sum(axis=0)
-    keep = energy > (np.percentile(energy, 20) if k > 5 else 0)
+    h0, hs = 0.0, [0.0]
+    if harmony:
+        beats_c = back.get('beats_c')
+        if beats_c is None:
+            beats_c = _beats_on_chroma_grid(back['beats'])
+        a = _sync_chroma(back['chroma'], beats_c)
+        b = _sync_chroma(_chroma(m), beats_c)
+        k = min(a.shape[1], b.shape[1])
+        a, b = a[:, :k], b[:, :k]
+        energy = b.sum(axis=0)
+        keep = energy > (np.percentile(energy, 20) if k > 5 else 0)
 
-    def cos(x, y_):
-        num = (x * y_).sum(axis=0)
-        den = np.linalg.norm(x, axis=0) * np.linalg.norm(y_, axis=0) + 1e-9
-        return float(np.mean((num / den)[keep])) if keep.any() else 0.0
+        def cos(x, y_):
+            num = (x * y_).sum(axis=0)
+            den = np.linalg.norm(x, axis=0) * np.linalg.norm(y_, axis=0) + 1e-9
+            return float(np.mean((num / den)[keep])) if keep.any() else 0.0
 
-    h0 = cos(a, b)
-    hs = [cos(np.roll(a, s, axis=0), b) for s in (1, 2, 3, 4, 5, 6, -1, -2, -3, -4, -5)]
+        h0 = cos(a, b)
+        hs = [cos(np.roll(a, s, axis=0), b) for s in (1, 2, 3, 4, 5, 6, -1, -2, -3, -4, -5)]
     win = SR
     rms = np.array([np.sqrt(np.mean(m[i:i + win] ** 2) + 1e-12) for i in range(0, max(1, len(m) - win), win)])
     db = 20 * np.log10(rms + 1e-12)

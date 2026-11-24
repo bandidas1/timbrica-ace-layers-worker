@@ -217,11 +217,19 @@ def handler(job):
             if seconds > MAX_SECONDS:
                 return {'error': 'too_long', 'seconds': round(seconds)}
             y, sr = sf.read(src, always_2d=True, dtype='float32')
+            # where the minutes go, per stage — read by the app (meta.result.timing) and the bench
+            tm = {'prep_s': time.time() - t0}
+            t1 = time.time()
             back = score.analyse_backing(y.T, sr)
             aes0 = _aes(y.T, sr)
+            tm['analyse_s'] = time.time() - t1
+            t1 = time.time()
             h = _ensure_model(model)
+            tm['model_s'] = time.time() - t1
             out = {}
             gpu_s = 0.0
+            score_s = 0.0
+            deliver_s = 0.0
             for t in tracks:
                 name = t['name']
                 caption = (t.get('caption') or name)[:400]
@@ -233,8 +241,9 @@ def handler(job):
                     path = _take(h, src, name, caption, seed_base + k, p, td)
                     torch.cuda.synchronize()
                     gpu_s += time.time() - g0
+                    s0 = time.time()
                     ty, tsr = sf.read(path, always_2d=True, dtype='float32')
-                    s = score.score_take(back, ty.T, tsr)
+                    s = score.score_take(back, ty.T, tsr, harmony=name not in ('drums', 'percussion'))
                     s['rank'] = score.rank_value(name, s)
                     if tsr == sr:
                         a = _aes(_mix(y.T, ty.T, mix_db), sr)
@@ -249,6 +258,7 @@ def handler(job):
                     s['seed'] = seed_base + k
                     s['_path'] = path
                     rows.append(s)
+                    score_s += time.time() - s0
                 # the best of the takes that passed — a better-ranked take of the wrong instrument does not
                 # hide a good one (v2 picked the argmax and dropped the track when it failed)
                 passed = [i for i, r in enumerate(rows) if r.get('ok', True)]
@@ -261,11 +271,15 @@ def handler(job):
                     entry['audio'] = [base64.b64encode(open(_encode(r['_path'], 'opus', td, '%s_%d' % (name, r['seed'])), 'rb').read()).decode()
                                       for r in pick]
                 if name in results and improved:
+                    d0 = time.time()
                     f = _encode(rows[best]['_path'], 'flac', td, name)
                     layers_io.upload(results[name], f, content_type='audio/flac', deadline=deadline)
                     entry['bytes'] = os.path.getsize(f)
+                    deliver_s += time.time() - d0
                 out[name] = entry
+            tm.update(gen_s=gpu_s, score_s=score_s, deliver_s=deliver_s)
             return {'ok': True, 'audio_s': round(seconds, 2), 'gpu_s': round(gpu_s, 2), 'wall_s': round(time.time() - t0, 2),
+                    'timing': {k: round(v, 1) for k, v in tm.items()},
                     'gpu': GPU, 'model': model, 'takes': takes, 'tracks': out, 'aes_backing': aes0,
                     'improved': any(v.get('improved') for v in out.values())}
     except layers_io.TransferError as e:

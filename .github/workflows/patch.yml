@@ -1,0 +1,54 @@
+name: patch-layer
+
+# Ship a source fix ONTO the image production already runs, not a rebuild.
+#
+# WHY: a rebuild of the very production commit resolves a different runtime — the Dockerfile pins few
+# packages (requests, matplotlib and the CUDA base float), and the sibling workers measured dozens of
+# changed packages on a same-commit rebuild (2026-11-04). This appends ONE layer with the worker's own
+# Python files to the exact production digest (`crane append`: registry-side, the ~12 GB of base layers
+# are never downloaded — and a host that has them cached pulls only this layer), then checks that each
+# file in the image is the file in this commit. Pin the printed digest in the RunPod template; never a tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "The image production runs: ghcr.io/…/timbrica-ace-layers-worker@sha256:…"
+        required: true
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same self-tests the full build runs: a red one stops the layer before it ships.
+      - name: Self-tests (transfer + take ranking)
+        run: |
+          python3 -m pip install -q requests numpy librosa==0.11.0 soundfile
+          python3 io_selftest.py
+          python3 score_selftest.py
+
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Append the worker files onto the production image
+        run: |
+          set -eu
+          case "${{ inputs.base }}" in *@sha256:*) ;; *) echo "base must be a DIGEST, not a tag"; exit 1;; esac
+          crane auth login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+          FILES="handler.py score.py layers_io.py"
+          mkdir -p layer/app/worker
+          for f in $FILES; do cp "$f" "layer/app/worker/$f"; done
+          tar -C layer --owner=0 --group=0 -cf layer.tar app
+          NEW="ghcr.io/${{ github.repository_owner }}/timbrica-ace-layers-worker:patch-${{ github.sha }}"
+          crane append -b "${{ inputs.base }}" -f layer.tar -t "$NEW"
+          echo "pin this in RunPod: ghcr.io/${{ github.repository_owner }}/timbrica-ace-layers-worker@$(crane digest "$NEW")"
+          for f in $FILES; do
+            a=$(crane export "$NEW" - | tar -xO "app/worker/$f" | sha256sum | cut -d' ' -f1)
+            b=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "$f image=$a commit=$b"
+            [ "$a" = "$b" ] || { echo "MISMATCH $f"; exit 1; }
+          done
